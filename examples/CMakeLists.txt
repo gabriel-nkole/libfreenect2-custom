@@ -54,16 +54,18 @@ SET(Protonect_DLLS
 IF(ENABLE_OPENGL)
   FIND_PACKAGE(GLFW3)
   FIND_PACKAGE(OpenGL)
+  find_package(OpenCV REQUIRED) # MEEE
+  include_directories(${OpenCV_INCLUDE_DIRS}) # MEEE
   IF(GLFW3_FOUND AND OPENGL_FOUND)
     INCLUDE_DIRECTORIES(
       ${GLFW3_INCLUDE_DIRS}
-      ${flextGL_INCLUDE_DIRS}
+      #${flextGL_INCLUDE_DIRS}
     )
 
     LIST(APPEND Protonect_DLLS ${GLFW3_DLL})
     LIST(APPEND Protonect_src
-      viewer.cpp
-      ${flextGL_SOURCES}
+      #${flextGL_SOURCES}
+      glad.c
     )
     LIST(APPEND Protonect_LIBRARIES
       ${GLFW3_LIBRARIES}
@@ -80,6 +82,8 @@ ADD_EXECUTABLE(Protonect
 TARGET_LINK_LIBRARIES(Protonect
   ${Protonect_LIBRARIES}
 )
+
+target_link_libraries(Protonect ${OpenCV_LIBS}) # MEEE
 
 IF(WIN32)
   INSTALL(TARGETS Protonect DESTINATION bin)

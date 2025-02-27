@@ -502,7 +502,7 @@ public:
     LOG_INFO << num_devices << " usb devices connected";
 
     if(num_devices > 0)
-    {
+    { // only enumerate if there are devices
       for(int idx = 0; idx < num_devices; ++idx)
       {
         libusb_device *dev = device_list[idx];

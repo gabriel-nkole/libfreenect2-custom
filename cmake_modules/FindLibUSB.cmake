@@ -56,6 +56,7 @@ FIND_LIBRARY(LibUSB_LIBRARIES
     Win32/Debug/dll
     MS64
     MS64/dll
+    
 )
 
 IF(WIN32)
