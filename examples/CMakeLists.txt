@@ -55,7 +55,12 @@ IF(ENABLE_OPENGL)
   FIND_PACKAGE(GLFW3)
   FIND_PACKAGE(OpenGL)
   find_package(OpenCV REQUIRED) # MEEE
+  find_package(OpenMP REQUIRED) # MEEE
   include_directories(${OpenCV_INCLUDE_DIRS}) # MEEE
+  include_directories(
+    imgui
+    imgui/backends
+  )
   IF(GLFW3_FOUND AND OPENGL_FOUND)
     INCLUDE_DIRECTORIES(
       ${GLFW3_INCLUDE_DIRS}
@@ -66,6 +71,13 @@ IF(ENABLE_OPENGL)
     LIST(APPEND Protonect_src
       #${flextGL_SOURCES}
       glad.c
+      imgui/imgui.cpp
+      imgui/imgui_demo.cpp
+      imgui/imgui_draw.cpp
+      imgui/imgui_tables.cpp
+      imgui/imgui_widgets.cpp
+      imgui/backends/imgui_impl_glfw.cpp
+      imgui/backends/imgui_impl_opengl3.cpp
     )
     LIST(APPEND Protonect_LIBRARIES
       ${GLFW3_LIBRARIES}
@@ -84,6 +96,7 @@ TARGET_LINK_LIBRARIES(Protonect
 )
 
 target_link_libraries(Protonect ${OpenCV_LIBS}) # MEEE
+target_link_libraries(Protonect OpenMP::OpenMP_CXX)
 
 IF(WIN32)
   INSTALL(TARGETS Protonect DESTINATION bin)

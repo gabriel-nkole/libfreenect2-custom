@@ -39,7 +39,12 @@
 /// [headers]
 #include <libfreenect2/config.h>
 #include "shader_m.h"
+
 #include <GLFW/glfw3.h>
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
 #include <cstdlib>
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
@@ -48,10 +53,13 @@
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtc/type_ptr.hpp"
 
+#include <omp.h>
+#include <random>
+#include <algorithm>
+
 bool protonect_shutdown = false; ///< Whether the running application should shut down.
 
-void sigint_handler(int s)
-{
+void sigint_handler(int s) {
   protonect_shutdown = true;
 }
 
@@ -63,8 +71,7 @@ libfreenect2::Freenect2Device *devtopause;
 //Though libusb operations are generally thread safe, I cannot guarantee
 //everything above is thread safe when calling start()/stop() while
 //waitForNewFrame().
-void sigusr1_handler(int s)
-{
+void sigusr1_handler(int s) {
   if (devtopause == 0)
     return;
 /// [pause]
@@ -80,23 +87,19 @@ void sigusr1_handler(int s)
 /// [logger]
 #include <fstream>
 #include <cstdlib>
-class MyFileLogger: public libfreenect2::Logger
-{
+class MyFileLogger: public libfreenect2::Logger {
 private:
   std::ofstream logfile_;
 public:
-  MyFileLogger(const char *filename)
-  {
+  MyFileLogger(const char *filename) {
     if (filename)
       logfile_.open(filename);
     level_ = Debug;
   }
-  bool good()
-  {
+  bool good() {
     return logfile_.is_open() && logfile_.good();
   }
-  virtual void log(Level level, const std::string &message)
-  {
+  virtual void log(Level level, const std::string &message) {
     logfile_ << "[" << libfreenect2::Logger::level2str(level) << "] " << message << std::endl;
   }
 };
@@ -110,7 +113,6 @@ public:
  * - cpu Perform depth processing with the CPU.
  * - gl  Perform depth processing with OpenGL.
  * - cl  Perform depth processing with OpenCL.
- * - <number> Serial number of the device to open.
  */
 
 
@@ -123,7 +125,8 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
 float ZPos = 0.0f;
 float MovementSpeed = 1.0f;
 
-glm::vec3 cameraRotation(25.0f, 315.0f, 0.0f);
+//glm::vec3 cameraRotation(25.0f, 315.0f, 0.0f);
+glm::vec3 cameraRotation(0.0f, 0.0f, 0.0f);
 float RotationSpeed = 0.5f;
 float LastX = 0.0f;
 float LastY = 0.0f;
@@ -132,7 +135,8 @@ float DeltaY = 0.0f;
 bool FirstMouse = true;
 
 float YOffset = 0.0f;
-float ZoomDistance = 2.0f;
+//float ZoomDistance = 2.0f;
+float ZoomDistance = 0.1f;
 float ZoomSpeed = 0.2f;
 
 // Camera
@@ -143,9 +147,22 @@ glm::mat4 T(1.0f);
 glm::mat4 R(1.0f);
 
 
-int main(int argc, char *argv[])
-/// [main]
-{
+// Constants
+const float PI = 3.1415926535897932385f;
+const float Deg2Rad = PI/180.0f;
+
+static const int M = 424;
+static const int N = 512;
+static const int NumVertices = M*N;
+const float fx=367.286994337726f;        // Focal length in X and Y
+const float fy=367.286855347968f;
+const float cx=255.165695200749f;        // Principle point in X and Y
+const float cy=211.824600345805f;
+
+const unsigned int histoSize = 360;
+
+
+int main(int argc, char *argv[]) {
   // glfw: initialize and configure
     // ------------------------------
     glfwInit();
@@ -157,8 +174,7 @@ int main(int argc, char *argv[])
     // glfw window creation
     // --------------------
     GLFWwindow* window = glfwCreateWindow(1280, 720, "LearnOpenGL", NULL, NULL);
-    if (window == NULL)
-    {
+    if (window == NULL) {
         std::cout << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
         return -1;
@@ -171,11 +187,24 @@ int main(int argc, char *argv[])
     // tell GLFW to capture our mouse
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
-  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
-    {
+  if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cout << "Failed to initialize GLAD" << std::endl;
         return -1;
   }
+
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGuiIO& io = ImGui::GetIO(); (void)io;
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+
+  // Setup Dear ImGui style
+  ImGui::StyleColorsDark();
+  //ImGui::StyleColorsLight();
+
+  // Setup Platform/Renderer backends
+  ImGui_ImplGlfw_InitForOpenGL(window, true);
+  ImGui_ImplOpenGL3_Init("#version 330 core");
   
 
   glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
@@ -184,23 +213,20 @@ int main(int argc, char *argv[])
   //glEnable(GL_BLEND);
   //glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-  Shader voxelShader = Shader("examples/shaders/voxel.vert", "examples/shaders/voxel.frag");
   Shader meshShader = Shader("examples/shaders/mesh.vert", "examples/shaders/mesh.frag");
 
 
   std::string program_path(argv[0]);
   std::cerr << "Version: " << LIBFREENECT2_VERSION << std::endl;
   std::cerr << "Environment variables: LOGFILE=<protonect.log>" << std::endl;
-  std::cerr << "Usage: " << program_path << " [-gpu=<id>] [gl | cl | clkde | cuda | cudakde | cpu] [<device serial>]" << std::endl;
+  std::cerr << "Usage: " << program_path << " [-gpu=<id>] [gl | cl | clkde | cuda | cudakde | cpu]" << std::endl;
   std::cerr << "        [-norgb | -nodepth] [-help] [-version]" << std::endl;
-  std::cerr << "        [-frames <number of frames to process>]" << std::endl;
   std::cerr << "To pause and unpause: pkill -USR1 Protonect" << std::endl;
   size_t executable_name_idx = program_path.rfind("Protonect");
 
   std::string binpath = "/";
 
-  if(executable_name_idx != std::string::npos)
-  {
+  if(executable_name_idx != std::string::npos) {
     binpath = program_path.substr(0, executable_name_idx);
   }
 
@@ -223,42 +249,64 @@ int main(int argc, char *argv[])
 
 /// [context]
   libfreenect2::Freenect2 freenect2;
-  libfreenect2::Freenect2Device *dev = 0;
   libfreenect2::PacketPipeline *pipeline = 0;
+
+  struct kinect_device {
+    std::string serial = "";
+    libfreenect2::Freenect2Device *dev = 0;
+    libfreenect2::SyncMultiFrameListener *listener;
+    libfreenect2::FrameMap frames;
+    libfreenect2::Registration* registration;
+    libfreenect2::Frame undistorted = libfreenect2::Frame(N, M, 4);
+    libfreenect2::Frame registered = libfreenect2::Frame(N, M, 4);
+    bool firstFrame = true;
+    bool newFrame = false;
+
+    cv::Mat rgb = cv::Mat(M, N, CV_8UC4);
+    cv::Mat rgbHD = cv::Mat(1080, 1920, CV_8UC4);
+    cv::Mat hsv = cv::Mat(M, N, CV_8UC3);
+    cv::Mat depth = cv::Mat(M, N, CV_32FC1);
+    cv::Mat depthSmooth = cv::Mat(M, N, CV_32FC1);
+
+    std::vector<float> meshVertices = std::vector<float>(NumVertices*10);
+    std::vector<float> meshVertices2 = std::vector<float>(NumVertices*10);
+    unsigned int meshVAO, meshVBO, meshEBO;
+    unsigned int meshVAO2, meshVBO2, meshEBO2;
+
+    std::vector<glm::vec3> positions = std::vector<glm::vec3>(NumVertices);
+    std::vector<glm::vec4> colors = std::vector<glm::vec4>(NumVertices);
+    std::vector<glm::vec3> normals = std::vector<glm::vec3>(NumVertices);
+
+    float histoDisplay[histoSize];
+
+    glm::vec3 cameraPosition;
+    glm::vec3 cameraRotation;
+  };
 /// [context]
 
-  std::string serial = "";
-
   int deviceId = -1;
-  size_t framemax = -1;
 
-  for(int argI = 1; argI < argc; ++argI)
-  {
+  for(int argI = 1; argI < argc; ++argI) {
     const std::string arg(argv[argI]);
 
-    if(arg == "-help" || arg == "--help" || arg == "-h" || arg == "-v" || arg == "--version" || arg == "-version")
-    {
+    if(arg == "-help" || arg == "--help" || arg == "-h" || arg == "-v" || arg == "--version" || arg == "-version") {
       // Just let the initial lines display at the beginning of main
       return 0;
     }
-    else if(arg.find("-gpu=") == 0)
-    {
-      if (pipeline)
-      {
+    else if(arg.find("-gpu=") == 0) {
+      if (pipeline) {
         std::cerr << "-gpu must be specified before pipeline argument" << std::endl;
         return -1;
       }
       deviceId = atoi(argv[argI] + 5);
     }
-    else if(arg == "cpu")
-    {
+    else if(arg == "cpu") {
       if(!pipeline)
 /// [pipeline]
         pipeline = new libfreenect2::CpuPacketPipeline();
 /// [pipeline]
     }
-    else if(arg == "gl")
-    {
+    else if(arg == "gl") {
 #ifdef LIBFREENECT2_WITH_OPENGL_SUPPORT
       if(!pipeline)
         pipeline = new libfreenect2::OpenGLPacketPipeline();
@@ -266,8 +314,7 @@ int main(int argc, char *argv[])
       std::cout << "OpenGL pipeline is not supported!" << std::endl;
 #endif
     }
-    else if(arg == "cl")
-    {
+    else if(arg == "cl") {
 #ifdef LIBFREENECT2_WITH_OPENCL_SUPPORT
       if(!pipeline)
         pipeline = new libfreenect2::OpenCLPacketPipeline(deviceId);
@@ -275,8 +322,7 @@ int main(int argc, char *argv[])
       std::cout << "OpenCL pipeline is not supported!" << std::endl;
 #endif
     }
-    else if(arg == "clkde")
-    {
+    else if(arg == "clkde") {
 #ifdef LIBFREENECT2_WITH_OPENCL_SUPPORT
       if(!pipeline)
         pipeline = new libfreenect2::OpenCLKdePacketPipeline(deviceId);
@@ -284,8 +330,7 @@ int main(int argc, char *argv[])
       std::cout << "OpenCL pipeline is not supported!" << std::endl;
 #endif
     }
-    else if(arg == "cuda")
-    {
+    else if(arg == "cuda") {
 #ifdef LIBFREENECT2_WITH_CUDA_SUPPORT
       if(!pipeline)
         pipeline = new libfreenect2::CudaPacketPipeline(deviceId);
@@ -293,8 +338,7 @@ int main(int argc, char *argv[])
       std::cout << "CUDA pipeline is not supported!" << std::endl;
 #endif
     }
-    else if(arg == "cudakde")
-    {
+    else if(arg == "cudakde") {
 #ifdef LIBFREENECT2_WITH_CUDA_SUPPORT
       if(!pipeline)
         pipeline = new libfreenect2::CudaKdePacketPipeline(deviceId);
@@ -302,59 +346,43 @@ int main(int argc, char *argv[])
       std::cout << "CUDA pipeline is not supported!" << std::endl;
 #endif
     }
-    else if(arg.find_first_not_of("0123456789") == std::string::npos) //check if parameter could be a serial number
-    {
-      serial = arg;
-    }
-    else if(arg == "-frames")
-    {
-      ++argI;
-      framemax = strtol(argv[argI], NULL, 0);
-      if (framemax == 0) {
-        std::cerr << "invalid frame count '" << argv[argI] << "'" << std::endl;
-        return -1;
-      }
-    }
-    else
-    {
+    else {
       std::cout << "Unknown argument: " << arg << std::endl;
     }
   }
 
 /// [discovery]
-  if(freenect2.enumerateDevices() == 0)
-  {
+  int numDevices = freenect2.enumerateDevices();
+  if(numDevices == 0) {
     std::cout << "no device connected!" << std::endl;
     return -1;
   }
 
-  if (serial == "")
-  {
-    serial = freenect2.getDefaultDeviceSerialNumber();
-    //std::string serial2 = freenect2.getDefaultDeviceSerialNumber();
-    //std::cout << "Serial: " << serial << "\n";
-    //std::cout << "Serial2: " << serial2 << "\n";
+  std::vector<kinect_device> devices(numDevices);
+  for (int k = 0; k < numDevices; k++) {
+    devices[k].serial = freenect2.getDeviceSerialNumber(k);
   }
 /// [discovery]
 
-  if(pipeline)
-  {
+  if(pipeline) {
 /// [open]
-    dev = freenect2.openDevice(serial, pipeline);
+    for (int k = 0; k < numDevices; k++) {
+      devices[k].dev = freenect2.openDevice(devices[k].serial, pipeline);
+    }
 /// [open]
   }
-  else
-  {
-    dev = freenect2.openDevice(serial);
+  else {
+    for (int k = 0; k < numDevices; k++) {
+      devices[k].dev = freenect2.openDevice(devices[k].serial);
+    }
   }
 
-  if(dev == 0)
-  {
+  if(devices[0].dev == 0) {
     std::cout << "failure opening device!" << std::endl;
     return -1;
   }
 
-  devtopause = dev;
+  devtopause = devices[0].dev;
 
   signal(SIGINT,sigint_handler);
 #ifdef SIGUSR1
@@ -362,55 +390,34 @@ int main(int argc, char *argv[])
 #endif
   protonect_shutdown = false;
 
-/// [listeners]
-  int types = libfreenect2::Frame::Color | libfreenect2::Frame::Ir | libfreenect2::Frame::Depth;
-  libfreenect2::SyncMultiFrameListener listener(types);
-  libfreenect2::FrameMap frames;
 
-  dev->setColorFrameListener(&listener);
-  dev->setIrAndDepthFrameListener(&listener);
-/// [listeners]
+  int types = libfreenect2::Frame::Color | libfreenect2::Frame::Depth;
+  for (int k = 0; k < numDevices; k++) {
+    /// [listeners]
+    devices[k].listener = new libfreenect2::SyncMultiFrameListener(types);
+    devices[k].dev->setColorFrameListener(devices[k].listener);
+    devices[k].dev->setIrAndDepthFrameListener(devices[k].listener);
+    
+    /// [start]
+    if (!devices[k].dev->start()) {
+      std::cout << "failure starting device " << k << "!" << std::endl;
+      return -1;
+    }
 
-/// [start]
-  if (!dev->start())
-    return -1;
+    /// [registration setup]
+    devices[k].registration = new libfreenect2::Registration(devices[k].dev->getIrCameraParams(), devices[k].dev->getColorCameraParams());
+  }
 
-  std::cout << "device serial: " << dev->getSerialNumber() << std::endl;
-  std::cout << "device firmware: " << dev->getFirmwareVersion() << std::endl;
-/// [start]
-
-/// [registration setup]
-  libfreenect2::Registration* registration = new libfreenect2::Registration(dev->getIrCameraParams(), dev->getColorCameraParams());
-  libfreenect2::Frame undistorted(512, 424, 4), registered(512, 424, 4);
-/// [registration setup]
-
-  size_t framecount = 0;
+  std::cout << "Devices:" << std::endl;
+  for (int k = 0; k < numDevices; k++) {
+    std::cout << k << std::endl;
+    std::cout << "  device serial: " << devices[k].dev->getSerialNumber() << std::endl;
+    std::cout << "  device firmware: " << devices[k].dev->getFirmwareVersion() << std::endl;
+  }
 
 
 /// [loop start]
-  const int M = 424;
-  const int N = 512;
-  cv::Mat cvRGB(M, N, CV_8UC4);
-  cv::Mat hdRGB(1080, 1920, CV_8UC4);
-
-  cv::Mat cvHSV(M, N, CV_8UC3);
-  cv::Mat cvDepth(M, N, CV_32FC1);
-  float numPoints = M * N;
-  float ratio = -static_cast<float>(N) / static_cast<float>(M);
-
-  const float PI = 3.1415926535897932385f;
-  const float Deg2Rad = PI/180.0f;
-  float vFOV = 60.0f;
-  float vDegreesPerPixel = vFOV/static_cast<float>(M);
-  float hFOV = 70.6f;
-  float hDegreesPerPixel = hFOV/static_cast<float>(N);
-
-  
   // mesh
-  int numVertices = M*N;
-  std::vector<float> meshVertices(numVertices*7);
-  std::vector<float> meshVertices2(numVertices*7);
-
   std::vector<unsigned int> meshIndices((M-1) * (N-1) * 2 * 3);
 
   int index = 0;
@@ -428,62 +435,79 @@ int main(int argc, char *argv[])
       }
   }
 
-  unsigned int meshVAO, meshVBO, meshEBO;
-  glGenVertexArrays(1, &meshVAO);
-  glGenBuffers(1, &meshVBO);
-  glGenBuffers(1, &meshEBO);
+  for (int k = 0; k < numDevices; k++) {
+    glGenVertexArrays(1, &devices[k].meshVAO);
+    glGenBuffers(1, &devices[k].meshVBO);
+    glGenBuffers(1, &devices[k].meshEBO);
+  
+    glBindVertexArray(devices[k].meshVAO);
+  
+    glBindBuffer(GL_ARRAY_BUFFER, devices[k].meshVBO);
+    glBufferData(GL_ARRAY_BUFFER, devices[k].meshVertices.size() * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+  
+    // position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // color attribute
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    // normal attribute
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(7 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+  
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, devices[k].meshEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, meshIndices.size() * sizeof(unsigned int), meshIndices.data(), GL_STATIC_DRAW);
+  
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+  
+  
+    glGenVertexArrays(1, &devices[k].meshVAO2);
+    glGenBuffers(1, &devices[k].meshVBO2);
+    glGenBuffers(1, &devices[k].meshEBO2);
+  
+    glBindVertexArray(devices[k].meshVAO2);
+  
+    glBindBuffer(GL_ARRAY_BUFFER, devices[k].meshVBO2);
+    glBufferData(GL_ARRAY_BUFFER, devices[k].meshVertices2.size() * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+  
+    // position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // color attribute
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    // normal attribute
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(7 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+  
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, devices[k].meshEBO2);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, meshIndices.size() * sizeof(unsigned int), meshIndices.data(), GL_STATIC_DRAW);
+  
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
 
-  glBindVertexArray(meshVAO);
 
-  glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
-  glBufferData(GL_ARRAY_BUFFER, meshVertices.size() * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
-
-  // position attribute
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
-  glEnableVertexAttribArray(0);
-  // color attribute
-  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
-  glEnableVertexAttribArray(1);
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, meshEBO);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, meshIndices.size() * sizeof(unsigned int), meshIndices.data(), GL_STATIC_DRAW);
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glBindVertexArray(0);
-
-
-  unsigned int meshVAO2, meshVBO2, meshEBO2;
-  glGenVertexArrays(1, &meshVAO2);
-  glGenBuffers(1, &meshVBO2);
-  glGenBuffers(1, &meshEBO2);
-
-  glBindVertexArray(meshVAO2);
-
-  glBindBuffer(GL_ARRAY_BUFFER, meshVBO2);
-  glBufferData(GL_ARRAY_BUFFER, meshVertices2.size() * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
-
-  // position attribute
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
-  glEnableVertexAttribArray(0);
-  // color attribute
-  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
-  glEnableVertexAttribArray(1);
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, meshEBO2);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, meshIndices.size() * sizeof(unsigned int), meshIndices.data(), GL_STATIC_DRAW);
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glBindVertexArray(0);
+    //if (k == 0) {
+    //  devices[k].cameraPosition = glm::vec3(-0.39f, 0.0f, 0.0f);
+    //  devices[k].cameraRotation = glm::vec3(25.0f, 30.0f, 0.0f);
+    //}
+    //if (k == 1) {
+    //  devices[k].cameraPosition = glm::vec3(0.39f, 0.0f, 0.0f);
+    //  devices[k].cameraRotation = glm::vec3(25.0f, -25.0f, 0.0f);
+    //}
+  }
+  
 
 
   // quads
   float quadVertices[] = {
-    -0.5f, -0.5f,  0.0f,  1.0f, 0.0f, 0.0f, 1.0f,
-     0.5f, -0.5f,  0.0f,  0.0f, 1.0f, 0.0f, 1.0f,
-    -0.5f,  0.5f,  0.0f,  0.0f, 0.0f, 1.0f, 1.0f,
-     0.5f,  0.5f,  0.0f,  1.0f, 1.0f, 0.0f, 1.0f
+    -0.5f, -0.5f,  0.0f,  1.0f, 0.0f, 0.0f, 1.0f,  0.0f, 0.0f, 1.0f,
+     0.5f, -0.5f,  0.0f,  0.0f, 1.0f, 0.0f, 1.0f,  0.0f, 0.0f, 1.0f,
+    -0.5f,  0.5f,  0.0f,  0.0f, 0.0f, 1.0f, 1.0f,  0.0f, 0.0f, 1.0f,
+     0.5f,  0.5f,  0.0f,  1.0f, 1.0f, 0.0f, 1.0f,  0.0f, 0.0f, 1.0f
   };
 
   unsigned int quadIndices[] = {  
@@ -493,24 +517,27 @@ int main(int argc, char *argv[])
     unsigned int VAO, VBO, EBO;
   };
   std::vector<quad> quads(1000);
-  for (size_t i = 0; i < quads.size(); i++) {
-    glGenVertexArrays(1, &quads[i].VAO);
-    glGenBuffers(1, &quads[i].VBO);
-    glGenBuffers(1, &quads[i].EBO);
+  for (size_t q = 0; q < quads.size(); q++) {
+    glGenVertexArrays(1, &quads[q].VAO);
+    glGenBuffers(1, &quads[q].VBO);
+    glGenBuffers(1, &quads[q].EBO);
 
-    glBindVertexArray(quads[i].VAO);
+    glBindVertexArray(quads[q].VAO);
 
-    glBindBuffer(GL_ARRAY_BUFFER, quads[i].VBO);
-    glBufferData(GL_ARRAY_BUFFER, 4 * 7 * sizeof(float), quadVertices, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, quads[q].VBO);
+    glBufferData(GL_ARRAY_BUFFER, 4 * 10 * sizeof(float), quadVertices, GL_DYNAMIC_DRAW);
 
     // position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
     // color attribute
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+    // normal attribute
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(7 * sizeof(float)));
+    glEnableVertexAttribArray(2);
 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quads[i].EBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quads[q].EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quadIndices), quadIndices, GL_STATIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -518,71 +545,491 @@ int main(int argc, char *argv[])
     glBindVertexArray(0);
   }
   
+  std::cout << "Threads: " << omp_get_max_threads() << "\n";
 
   float deltaTime = 0.0f;	// time between current frame and last frame
   float lastFrame = 0.0f;
-  bool firstFrame = true;
-  while(!glfwWindowShouldClose(window) && !protonect_shutdown && (framemax == (size_t)-1 || framecount < framemax))
-  {
+  while(!glfwWindowShouldClose(window) && !protonect_shutdown) {
     float currentFrame = static_cast<float>(glfwGetTime());
     deltaTime = currentFrame - lastFrame;
     lastFrame = currentFrame;
 
+    for (int k = 0; k < numDevices; k++) {
+      devices[k].newFrame = false;
+      if (devices[k].listener->hasNewFrame() || devices[k].firstFrame) {
+        devices[k].newFrame = true;
+  
+        if (devices[k].firstFrame)
+          devices[k].firstFrame = false;                          // 10 seconds
+        if (!devices[k].listener->waitForNewFrame(devices[k].frames, 10*1000)) {
+          std::cout << "timeout!" << std::endl;
+          return -1;
+        }
+        libfreenect2::Frame *rgb = devices[k].frames[libfreenect2::Frame::Color];
+        libfreenect2::Frame *depth = devices[k].frames[libfreenect2::Frame::Depth];
+  
+        devices[k].registration->apply(rgb, depth, &devices[k].undistorted, &devices[k].registered);
+  
+        std::memcpy(devices[k].rgb.data, devices[k].registered.data, M * N * 4);
+        cv::flip(devices[k].rgb, devices[k].rgb, 1);
+        //std::memcpy(devices[k].rgbHD.data,   rgb->data, 1080 * 1920 * 4);
+        //cv::flip(devices[k].rgbHD, devices[k].rgbHD, 1);
+  
+        cv::cvtColor(devices[k].rgb, devices[k].hsv, cv::COLOR_BGR2HSV);
+        std::memcpy(devices[k].depth.data,   depth->data, M * N * 4);
+        cv::flip(devices[k].depth, devices[k].depth, 1);
+        //cv::blur(devices[k].depth, devices[k].depthSmooth, cv::Size( 10, 10 ), cv::Point(-1,-1) );
+        cv::GaussianBlur( devices[k].depth, devices[k].depthSmooth, cv::Size( 7, 7 ), 0, 0 );
+        //cv::medianBlur(devices[k].depth, devices[k].depth, 5);
+        //std::memcpy(devices[k].depthSmooth.data,   devices[k].depth.data, M * N * 4);
+        std::memcpy(devices[k].depth.data,   devices[k].depthSmooth.data, M * N * 4);
+
+        if (k==0) {
+          //cv::imwrite("rgb.jpg", devices[k].rgb);
+          //cv::imwrite("depth.jpg", devices[k].depth);
+        }
+
+        devices[k].listener->release(devices[k].frames);
+      }
+    }
+
+
+    float maxDeltaZ = 0.05f;
+    float nonBlackThreshold = 0.0056f;
+    float grayScaleThreshold = 0.06f;
+
+    for (int k = 0; k < numDevices; k++) {
+      int numQuads = 0;
+
+      glm::mat4 T = glm::translate(glm::mat4(1.0f), devices[k].cameraPosition);
+      glm::mat4 R = glm::rotate(glm::mat4(1.0f), glm::radians(-devices[k].cameraRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+      R = glm::rotate(R, glm::radians(-devices[k].cameraRotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+      glm::mat4 transform = T * R;
+      //glm::mat4 transform = glm::mat4(1.0f);
+
+      
+      if (devices[k].newFrame) {
+        std::fill(devices[k].meshVertices.begin(), devices[k].meshVertices.end(), 0.0f);
+        std::fill(devices[k].meshVertices2.begin(), devices[k].meshVertices2.end(), 0.0f);
+  
+        std::vector<int> histoMap(M*N, -1);
+        std::vector<std::pair<unsigned int, unsigned int>> histo(histoSize, std::pair<unsigned int, unsigned int>(0, 0));
+        for (int i = 0; i < histoSize; i++) {
+          histo[i].first = i;
+        }
+        std::vector<std::vector<unsigned int>> histoPoints(histoSize, std::vector<unsigned int>());
+  
+        #pragma omp parallel for
+        for (int i = 0; i < M*N; i++) {
+          int m = i / N;
+          int n = i % N; 
+  
+          float depth = devices[k].depth.at<float>(m, n)/1000.0f;
+          uchar* pixel = devices[k].rgb.ptr<uchar>(m, n);
+          
+          glm::vec3 pos = glm::vec3((static_cast<float>(n) - cx) * depth / fx, (static_cast<float>(M-1 - m) - cy) * depth / fy, -depth);
+          pos = glm::vec3(transform * glm::vec4(pos, 1.0f));
+          glm::vec4 color = glm::vec4(*(pixel+2)/255.0f, *(pixel+1)/255.0f, *(pixel)/255.0f, 1.0f);
+  
+          glm::vec3 posOtherHorizontal = glm::vec3(0.0f);
+          glm::vec3 posOtherVertical = glm::vec3(0.0f);
+          if (depth == 0.0f || depth >= 2.5f) {
+            color.w = 0.0f;
+          }
+          for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+              if (y == 0 && x == 0)
+                continue;
+              if (m+y < 0 || m+y >= M || n+x < 0 || n+x >= N)
+                continue;
+              float depthOther = devices[k].depth.at<float>(m+y, n+x)/1000.0f;
+              if (abs(depth-depthOther) > maxDeltaZ) {
+                color.w = 0.0f;
+              }
+  
+              float depthSmoothOther = devices[k].depthSmooth.at<float>(m+y, n+x)/1000.0f;
+              glm::vec3 posOther = glm::vec3((static_cast<float>(n+x) - cx) * depthSmoothOther / fx, (static_cast<float>(M-1 - (m+y)) - cy) * depthSmoothOther / fy, -depthSmoothOther);
+              posOther = glm::vec3(transform * glm::vec4(posOther, 1.0f));
+              if (y==0) {
+                posOtherHorizontal = posOther;
+              }
+              if (x==0) {
+                posOtherVertical = posOther;
+              }
+            }
+          }
+          float depthFlat = devices[k].depthSmooth.at<float>(m, n)/1000.0f;
+          glm::vec3 posFlat = glm::vec3((static_cast<float>(n) - cx) * depthFlat / fx, (static_cast<float>(M-1 - m) - cy) * depthFlat / fy, -depthFlat);
+          posFlat = glm::vec3(transform * glm::vec4(posFlat, 1.0f));
+          glm::vec3 a = posOtherHorizontal - posFlat;
+          glm::vec3 b = posOtherVertical - posFlat;
+          glm::vec3 normal = glm::normalize(glm::cross(b, a));
+          
+  
+          if (color.w > 0.1f && (color.x > nonBlackThreshold || color.y > nonBlackThreshold || color.z > nonBlackThreshold)) {
+              unsigned int pixelHisto;
+              if (abs(color.x - color.y) < grayScaleThreshold && abs(color.y - color.z) < grayScaleThreshold && abs(color.z - color.x) < grayScaleThreshold) {
+                int pixelGray = 180 + static_cast<int>(color.x*179.0f);
+                pixelHisto = pixelGray;
+              }
+              else {
+                uchar* pixelHSV = devices[k].hsv.ptr<uchar>(m, n);
+                pixelHisto = *pixelHSV;
+              }
+  
+              histoMap[i] = pixelHisto;
+          }
+          
+          int index = m*N + n;
+          int index2 = (m*N + n)*10;
+          devices[k].meshVertices[index2 + 0] = pos.x;
+          devices[k].meshVertices[index2 + 1] = pos.y;
+          devices[k].meshVertices[index2 + 2] = pos.z;
+          devices[k].meshVertices[index2 + 3] = color.x;
+          devices[k].meshVertices[index2 + 4] = color.y;
+          devices[k].meshVertices[index2 + 5] = color.z;
+          devices[k].meshVertices[index2 + 6] = color.w;
+          devices[k].meshVertices[index2 + 7] = normal.x;
+          devices[k].meshVertices[index2 + 8] = normal.y;
+          devices[k].meshVertices[index2 + 9] = normal.z;
+  
+          devices[k].meshVertices2[index2 + 0] = pos.x;
+          devices[k].meshVertices2[index2 + 1] = pos.y;
+          devices[k].meshVertices2[index2 + 2] = pos.z;
+          devices[k].meshVertices2[index2 + 7] = normal.x;
+          devices[k].meshVertices2[index2 + 8] = normal.y;
+          devices[k].meshVertices2[index2 + 9] = normal.z;
+  
+          devices[k].positions[index] = pos;
+          devices[k].colors[index] = color;
+          devices[k].normals[index] = normal;
+        }
+  
+        for (int i = 0; i < M*N; i++) {
+          int pixelHisto = histoMap[i];
+          if (pixelHisto != -1) {
+              histo[pixelHisto].second += 1;
+              histoPoints[pixelHisto].push_back(i);
+          }
+        }
+        
+        
+        unsigned int maxCount = 1;
+        for (int i = 0; i < histoSize; i++) {
+          devices[k].histoDisplay[i] = static_cast<float>(histo[i].second);
+          if (histo[i].second > maxCount) {
+            maxCount = histo[i].second;
+          }
+        }
+        float maxCountf = static_cast<float>(maxCount);
+        for (int i = 0; i < histoSize; i++) {
+          devices[k].histoDisplay[i] /= maxCountf;
+        }
+  
+  
+        
+        auto hueComp = [](std::pair<unsigned int, unsigned int> a, std::pair<unsigned int, unsigned int> b) {
+          return a.first < b.first;
+        };
+        auto countComp = [](std::pair<unsigned int, unsigned int> a, std::pair<unsigned int, unsigned int> b) {
+          return a.second > b.second;
+        };
+  
+        
+        // parameters
+        int maxAttempts = 100;
+        int radius = 1;
+        unsigned int planeThreshold = 5;
+        float stdDev = 0.0f;
+        float distThreshold = 0.05f;
+        float dotThreshold = cosf(Deg2Rad * 15.0f);
+        float dotThresholdRelaxed = cosf(Deg2Rad * 45.0f);
+  
+        bool foundPlane = true;
+        int numPlanes = 0;
+        while (foundPlane) {
+          foundPlane = false;
+          std::sort(histo.begin(), histo.end(), countComp);
+          for (int r = 0; r < histoSize; r++) {
+            if (histo[r].second < planeThreshold) {
+              break;
+            }
+            unsigned int hue = static_cast<unsigned int>(histo[r].first);
+            std::sort(histo.begin(), histo.end(), hueComp);
+  
+            int left = 0;
+            int right = 0;
+            if (hue < 180) {
+              for (int x = -1; x >= -89; x--) {
+                int hue_x = hue + x;
+                if (hue_x < 0) {
+                  hue_x += 180;
+                }
+                if (histo[hue_x].second == 0)
+                  break;
+                left = x;
+              }
+              for (int x = 1; x <= 90; x++) {
+                int hue_x = hue + x;
+                if (hue_x >= 180) {
+                  hue_x -= 180;
+                }
+                if (histo[hue_x].second == 0)
+                  break;
+                right = x;
+              }
+            }
+            else {
+              for (int x = -1; (hue+x) >= 0; x--) {
+                int hue_x = hue + x;
+                if (histo[hue_x].second == 0)
+                  break;
+                left = x;
+              }
+              for (int x = 1; (hue+x) < histoSize; x++) {
+                int hue_x = hue + x;
+                if (histo[hue_x].second == 0)
+                  break;
+                right = x;
+              }
+            }
+  
+  
+            std::vector<std::pair<glm::u32mat3x2, unsigned int>> possiblePlanes(maxAttempts, std::pair<glm::u32mat3x2, unsigned int>(glm::u32mat3x2(0), 0));
+             
+            bool existsPlane = false;
+            #pragma omp parallel
+            {
+              int thread_id = omp_get_thread_num();
+  
+              std::random_device rd{};
+              std::mt19937 gen{rd()};
+              gen.seed(thread_id);
+              std::normal_distribution<float> normalDistribution{0.0f, stdDev};
+              srand(thread_id);
+  
+              int numThreads = omp_get_num_threads();
+              int chunk = std::ceil(static_cast<float>(maxAttempts)/static_cast<float>(numThreads));
+              int boundary = thread_id == numThreads-1 ? maxAttempts : (thread_id+1)*chunk;
+              for (int attempt = thread_id*chunk; attempt < boundary; attempt++) {  
+                unsigned int rd_huesAndIndices[6];
+                unsigned int planeIndices[3];
+                for (int i = 0; i < 3; i++) {
+                  int rd_hue = static_cast<int>(hue) + std::min(right, std::max(left, static_cast<int>(normalDistribution(gen))));
+                  rd_hue = hue < 180 ? (rd_hue < 0 ? rd_hue+=180 : (rd_hue >= 180 ? rd_hue-=180 : rd_hue)) : rd_hue;
+                  int rd_num = rand() % histoPoints[rd_hue].size();
+                  unsigned int vertIndex = histoPoints[rd_hue][rd_num];
+                  
+                  rd_huesAndIndices[i*2 + 0] = rd_hue;
+                  rd_huesAndIndices[i*2 + 1] = vertIndex;
+                  planeIndices[i] = vertIndex;
+                }
+                if (planeIndices[0] == planeIndices[1] || planeIndices[0] == planeIndices[2] || planeIndices[1] == planeIndices[2]) {
+                  continue;
+                }
+                
+                
+                glm::vec3 a = devices[k].positions[planeIndices[1]] - devices[k].positions[planeIndices[0]];
+                glm::vec3 b = devices[k].positions[planeIndices[2]] - devices[k].positions[planeIndices[0]];
+                glm::vec3 normal = glm::normalize(glm::cross(a, b));
+                //std::cout << normal.x << " " << normal.y << " " << normal.z << "\n";
+                float d = glm::dot(normal, -devices[k].positions[planeIndices[0]]);
+        
+                unsigned int count = 0;
+                //#pragma omp parallel for reduction(+:count)
+                for (int x = -radius; x <= radius; x++) {
+                  if (x < left || x > right) {
+                    continue;
+                  }
+                  int hue_x = hue + x;
+                  hue_x = hue < 180 ? (hue_x < 0 ? hue_x+=180 : (hue_x >= 180 ? hue_x-=180 : hue_x)) : hue_x;
+  
+                  for (int i = 0; i < histoPoints[hue_x].size(); i++) {
+                    unsigned int vertIndex = histoPoints[hue_x][i];
+                    
+                    float D = abs(glm::dot(normal, devices[k].positions[vertIndex]) + d);
+                    if (D < distThreshold && abs(glm::dot(normal, devices[k].normals[vertIndex])) > dotThreshold) {
+                      count++;
+                    }
+                  }
+                }
+    
+                if (count >= planeThreshold) {
+                  existsPlane = true;
+                  possiblePlanes[attempt] = std::pair<glm::u32mat3x2, unsigned int>(glm::u32mat3x2(rd_huesAndIndices[0], rd_huesAndIndices[1], rd_huesAndIndices[2], rd_huesAndIndices[3], rd_huesAndIndices[4], rd_huesAndIndices[5]), count);
+                }
+              }
+            }
+            
+            
+            // draw Quad
+            if (!existsPlane) {
+              continue;
+            }
+            else {
+              unsigned int maxPointIndex = 0;
+              unsigned int maxPointCount = possiblePlanes[0].second;
+              for (int i = 1; i < maxAttempts; i++) {
+                if (possiblePlanes[i].second > maxPointCount) {
+                  maxPointIndex = i;
+                  maxPointCount = possiblePlanes[i].second;
+                }
+              }
+  
+  
+              unsigned int rd_hue1 = possiblePlanes[maxPointIndex].first[0][0];
+              unsigned int vert1Index = possiblePlanes[maxPointIndex].first[0][1];
+              unsigned int rd_hue2 = possiblePlanes[maxPointIndex].first[1][0];
+              unsigned int vert2Index = possiblePlanes[maxPointIndex].first[1][1];
+              unsigned int rd_hue3 = possiblePlanes[maxPointIndex].first[2][0];
+              unsigned int vert3Index = possiblePlanes[maxPointIndex].first[2][1];
+  
+              histo[rd_hue1].second -= 1;
+              histo[rd_hue2].second -= 1;
+              histo[rd_hue3].second -= 1;
+              histoPoints[rd_hue1].erase(std::lower_bound(histoPoints[rd_hue1].begin(), histoPoints[rd_hue1].end(), vert1Index));
+              histoPoints[rd_hue2].erase(std::lower_bound(histoPoints[rd_hue2].begin(), histoPoints[rd_hue2].end(), vert2Index));
+              histoPoints[rd_hue3].erase(std::lower_bound(histoPoints[rd_hue3].begin(), histoPoints[rd_hue3].end(), vert3Index));
+  
+  
+              std::vector<unsigned int> planePointsIndices;
+              planePointsIndices.push_back(vert1Index);
+              planePointsIndices.push_back(vert2Index);
+              planePointsIndices.push_back(vert3Index);
+  
+              glm::vec3 a = devices[k].positions[vert2Index] - devices[k].positions[vert1Index];
+              glm::vec3 b = devices[k].positions[vert3Index] - devices[k].positions[vert1Index];
+              glm::vec3 normal = glm::normalize(glm::cross(a, b));
+              float d = glm::dot(normal, -devices[k].positions[vert1Index]);
+      
+              for (int hue_x = 0; hue_x < histoSize; hue_x++) {
+                int count = 0;
+                std::vector<unsigned int> remainingVertIndices;
+                for (int i = 0; i < histoPoints[hue_x].size(); i++) {
+                  unsigned int vertIndex = histoPoints[hue_x][i];
+                            
+                  float D = abs(glm::dot(normal, devices[k].positions[vertIndex]) + d);
+                  if (D < distThreshold && abs(glm::dot(normal, devices[k].normals[vertIndex])) > dotThresholdRelaxed) {
+                    planePointsIndices.push_back(vertIndex);
+                    count++;
+                  }
+                  else {
+                    remainingVertIndices.push_back(vertIndex);
+                  }
+                }
+                histo[hue_x].second -= count;
+                histoPoints[hue_x] = remainingVertIndices;
+              }
+  
+    
+              glm::vec4 planeColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+              /*
+              for (int i = 0; i < planePointsIndices.size(); i++) {
+                unsigned int vertIndex = planePointsIndices[i];
+    
+                planeColor.x += colors[vertIndex].x;
+                planeColor.y += colors[vertIndex].y;
+                planeColor.z += colors[vertIndex].z;
+                planeColor.w += colors[vertIndex].w;
+              }
+              planeColor.x /= planePointsIndices.size();
+              planeColor.y /= planePointsIndices.size();
+              planeColor.z /= planePointsIndices.size();
+              planeColor.w /= planePointsIndices.size();
+              */
+              
+              planeColor = glm::vec4((numPlanes >> 0) & 1, (numPlanes >> 1) & 1, (numPlanes >> 2) & 1, 1.0f);
+              for (int i = 0; i < planePointsIndices.size(); i++) {
+                unsigned int vertIndex = planePointsIndices[i];
+    
+                devices[k].meshVertices2[vertIndex*10 + 3] = planeColor.x;
+                devices[k].meshVertices2[vertIndex*10 + 4] = planeColor.y;
+                devices[k].meshVertices2[vertIndex*10 + 5] = planeColor.z;
+                devices[k].meshVertices2[vertIndex*10 + 6] = planeColor.w;
+              }
+  
+              foundPlane = true;
+              numPlanes++;
+              break;
+            }
+          }
+        }
+        
+  
+        glBindVertexArray(devices[k].meshVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, devices[k].meshVBO);
+        glBufferData(GL_ARRAY_BUFFER, devices[k].meshVertices.size() * sizeof(float), devices[k].meshVertices.data(), GL_DYNAMIC_DRAW);
+  
+        glBindVertexArray(devices[k].meshVAO2);
+        glBindBuffer(GL_ARRAY_BUFFER, devices[k].meshVBO2);
+        glBufferData(GL_ARRAY_BUFFER, devices[k].meshVertices2.size() * sizeof(float), devices[k].meshVertices2.data(), GL_DYNAMIC_DRAW);
+  
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+      }
+    }
+
+
+
     //glViewport(0, 0, 1280, 720);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    
 
     glm::mat4 P = glm::perspective(glm::radians(89.0f), 1280.0f / 720.0f, 0.01f, 1000.0f);
 
     // Update Camera
-    // movement
-    float multiplier = 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
-        multiplier = 30.0f;
-    }
-            
-    int xInput = 0;
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-        xInput += 1;
-    }
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-        xInput -= 1;
-    }
-    if (xInput > 0) {
-        ZPos -= multiplier * MovementSpeed * deltaTime;
-    }
-    else if (xInput < 0) {
-        ZPos += multiplier * MovementSpeed * deltaTime;
+    const auto& io = ImGui::GetIO();
+
+    if (!io.WantCaptureKeyboard) {
+      // movement
+      float multiplier = 1.0f;
+      if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
+          multiplier = 30.0f;
+      }
+              
+      int xInput = 0;
+      if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+          xInput += 1;
+      }
+      if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+          xInput -= 1;
+      }
+      if (xInput > 0) {
+          ZPos -= multiplier * MovementSpeed * deltaTime;
+      }
+      else if (xInput < 0) {
+          ZPos += multiplier * MovementSpeed * deltaTime;
+      }
     }
 
+    if (!io.WantCaptureMouse) {
+      // rotation
+      if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+        cameraRotation.y += RotationSpeed * DeltaX;
+        if (cameraRotation.y < 0.0f)
+            cameraRotation.y += 360.0f;
+        else if (cameraRotation.y > 360.0f)
+            cameraRotation.y -= 360.0f;
+  
+        cameraRotation.x += RotationSpeed * DeltaY;
+        if (cameraRotation.x < -89.0f)
+            cameraRotation.x = -89.0f;
+        else if (cameraRotation.x > 89.0f)
+            cameraRotation.x = 89.0f;
+  
+        DeltaX = 0.0f;
+        DeltaY = 0.0f;
+      }
 
-    // rotation
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-      cameraRotation.y += RotationSpeed * DeltaX;
-      if (cameraRotation.y < 0.0f)
-          cameraRotation.y += 360.0f;
-      else if (cameraRotation.y > 360.0f)
-          cameraRotation.y -= 360.0f;
 
-      cameraRotation.x += RotationSpeed * DeltaY;
-      if (cameraRotation.x < -89.0f)
-          cameraRotation.x = -89.0f;
-      else if (cameraRotation.x > 89.0f)
-          cameraRotation.x = 89.0f;
-
-      DeltaX = 0.0f;
-      DeltaY = 0.0f;
-    } 
-
-    
-    // zoom
-    ZoomDistance += YOffset * ZoomSpeed;
-    YOffset = 0.0f;
-    if (ZoomDistance < 0.2f) {
-        ZoomDistance = 0.2f;
-    }
-    else if (ZoomDistance > 20.0f) {
-        ZoomDistance = 20.0f;
+      // zoom
+      ZoomDistance += YOffset * ZoomSpeed;
+      YOffset = 0.0f;
+      if (ZoomDistance < 0.2f) {
+          ZoomDistance = 0.2f;
+      }
+      else if (ZoomDistance > 20.0f) {
+          ZoomDistance = 20.0f;
+      }
     }
 
 
@@ -600,286 +1047,40 @@ int main(int argc, char *argv[])
     glm::mat4 VP = P * V;
 
 
-    int numQuads = 0;
-    if (listener.hasNewFrame() || firstFrame) {
-      if (firstFrame)
-        firstFrame = false;
-      if (!listener.waitForNewFrame(frames, 10*1000)) // 10 sconds
-      {
-        std::cout << "timeout!" << std::endl;
-        return -1;
-      }
-      libfreenect2::Frame *rgb = frames[libfreenect2::Frame::Color];
-      libfreenect2::Frame *depth = frames[libfreenect2::Frame::Depth];
-  /// [loop start]
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
 
-  /// [registration]
-      registration->apply(rgb, depth, &undistorted, &registered);
+    //ImGui::ShowDemoWindow(0);
+    ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+    ImGui::NewLine();
 
-      framecount++;
+    //static float x = 0.0f;
+    //ImGui::DragFloat("drag float", &x, 0.005f, -5.0f, 5.0f);
+    for (int k = 0; k < numDevices; k++) {
+      std::string cameraPosString = "CameraPos-" + std::to_string(k);
+      std::string cameraRotString = "CameraRot-" + std::to_string(k);
+      ImGui::DragFloat3(cameraPosString.c_str(), &devices[k].cameraPosition.x, 0.01f, -0.5f, 0.5f);
+      ImGui::DragFloat3(cameraRotString.c_str(), &devices[k].cameraRotation.x, 1.0f, -90.0f, 90.0f);
 
-      std::fill(meshVertices.begin(), meshVertices.end(), 0.0f);
-      std::fill(meshVertices2.begin(), meshVertices2.end(), 0.0f);
-      std::memcpy(cvRGB.data, registered.data, depth->height * depth->width * 4);
-      cv::flip(cvRGB, cvRGB, 1);
-      //std::memcpy(hdRGB.data,   rgb->data, rgb->height * rgb->width * 4);
-      //cv::flip(hdRGB, hdRGB, 1);
-
-      cv::cvtColor(cvRGB, cvHSV, cv::COLOR_RGB2HSV);
-      std::memcpy(cvDepth.data,   depth->data, depth->height * depth->width * 4);
-      cv::flip(cvDepth, cvDepth, 1);
-
-      std::vector<std::pair<unsigned int, unsigned int>> histo(180, std::pair<unsigned int, unsigned int>(0, 0));
-      for (int i = 0; i < 180; i++) {
-        histo[i].first = i;
-      }
-      std::vector<std::vector<unsigned int>> histoPoints(180, std::vector<unsigned int>());
-
-      float maxDeltaZ = 0.05f;
-      for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-          float depth = cvDepth.at<float>(m, n)/1000.0f;
-          uchar* pixel = cvRGB.ptr<uchar>(m, n);
-          
-          glm::vec3 pos = glm::vec3(tanf(Deg2Rad * (static_cast<float>(n) - N/2.0f)*hDegreesPerPixel) * depth, tanf(Deg2Rad * (static_cast<float>(M-1 - m) - M/2.0f)*vDegreesPerPixel) * depth, -depth);
-          glm::vec4 color = glm::vec4(*(pixel+2)/255.0f, *(pixel+1)/255.0f, *(pixel)/255.0f, 1.0f);
-
-          if (depth == 0.0f) {
-            color.w = 0.0f;
-          }
-          else {
-            bool exitLoop = false;
-            for (int y = -1; y <= 1; y++) {
-              for (int x = -1; x <= 1; x++) {
-                if (y == 0 && x == 0)
-                  continue;
-                if (m+y < 0 || m+y >= M || n+x < 0 || n+x >= N)
-                  continue;
-                float depthOther = cvDepth.at<float>(m+y, n+x)/1000.0f;
-
-                if (abs(depth-depthOther) > maxDeltaZ) {
-                  color.w = 0.0f;
-                  exitLoop = true;
-                  break;
-                }
-              }
-              if (exitLoop)
-                break;
-            }
-          }
-          
-
-          if (color.w > 0.1f) {
-              uchar* pixelHSV = cvHSV.ptr<uchar>(m, n);
-              histo[*pixelHSV].second += 1;
-
-              histoPoints[*pixelHSV].push_back((m*N + n)*7);
-          }
-          
-          int index = (m*N + n)*7;
-          meshVertices[index + 0] = pos.x;
-          meshVertices[index + 1] = pos.y;
-          meshVertices[index + 2] = pos.z;
-          meshVertices[index + 3] = color.x;
-          meshVertices[index + 4] = color.y;
-          meshVertices[index + 5] = color.z;
-          meshVertices[index + 6] = color.w;
-
-          meshVertices2[index + 0] = pos.x;
-          meshVertices2[index + 1] = pos.y;
-          meshVertices2[index + 2] = pos.z;
-        }
-      }
-      //std::memcpy(meshVertices2.data(), meshVertices.data(), meshVertices.size() * sizeof(float));
-
-
-      
-      auto hueComp = [](std::pair<unsigned int, unsigned int> a, std::pair<unsigned int, unsigned int> b) {
-        return a.first < b.first;
-      };
-
-      auto countComp = [](std::pair<unsigned int, unsigned int> a, std::pair<unsigned int, unsigned int> b) {
-        return a.second > b.second;
-      };
-      
-      /*
-      while (true) {
-        std::sort(histo.begin(), histo.end(), countComp);
-        bool foundPlane = false;
-        for (int r = 0; r < 180; r++) {
-          if (histo[0].second < 4) {
-            break;
-          }
-  
-          uchar hue = static_cast<uchar>(histo[r].first);
-          std::sort(histo.begin(), histo.end(), hueComp);
-          std::vector<unsigned int> vertIndices = histoPoints[hue];
-  
-          int rd_num = rand() % vertIndices.size();
-          unsigned int vert1Index = vertIndices[rd_num];
-          vertIndices.erase(vertIndices.begin() + rd_num);
-          
-          rd_num = rand() % vertIndices.size();
-          unsigned int vert2Index = vertIndices[rd_num];
-          vertIndices.erase(vertIndices.begin() + rd_num);
-  
-          rd_num = rand() % vertIndices.size();
-          unsigned int vert3Index = vertIndices[rd_num];
-          vertIndices.erase(vertIndices.begin() + rd_num);
-  
-          glm::vec3 vert1Pos = glm::vec3(meshVertices[vert1Index], meshVertices[vert1Index + 1], meshVertices[vert1Index + 2]);
-          glm::vec3 vert2Pos = glm::vec3(meshVertices[vert2Index], meshVertices[vert2Index + 1], meshVertices[vert2Index + 2]);
-          glm::vec3 vert3Pos = glm::vec3(meshVertices[vert3Index], meshVertices[vert3Index + 1], meshVertices[vert3Index + 2]);
-  
-          glm::vec3 a = vert2Pos - vert1Pos;
-          glm::vec3 b = vert3Pos - vert1Pos;
-          glm::vec3 normal = glm::cross(a, b);
-          float d = normal.x * -a.x + normal.y * -a.y + normal.z * -a.z;
-          float denom = 1.0f / sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
-  
-  
-          std::vector<unsigned int> planePointsIndices = {vert1Index, vert2Index, vert3Index};
-          std::vector<unsigned int> remainingVertIndices;
-          for (int i = 0; i < vertIndices.size(); i++) {
-            unsigned int vertIndex = vertIndices[i];
-            glm::vec3 pos = glm::vec3(meshVertices[vertIndex], meshVertices[vertIndex + 1], meshVertices[vertIndex + 2]);
-            
-            float D = abs(normal.x * pos.x + normal.y * pos.y + normal.z * pos.z + d) * denom;
-            if (D < 0.05f) {
-              planePointsIndices.push_back(vertIndex);
-            }
-            else {
-              remainingVertIndices.push_back(vertIndex);
-            }
-          }
-          
-          // draw Quad
-          if (planePointsIndices.size() < 1000) {
-            continue;
-          }
-          else {
-            histo[hue].second -= planePointsIndices.size();
-            histoPoints[hue] = remainingVertIndices;
-  
-            for (int hue_x = hue-1; hue_x >= 0; hue_x--) {
-              vertIndices = histoPoints[hue_x];
-              int count = 0;
-              for (int i = 0; i < vertIndices.size(); i++) {
-                unsigned int vertIndex = vertIndices[i];
-                glm::vec3 pos = glm::vec3(meshVertices[vertIndex], meshVertices[vertIndex + 1], meshVertices[vertIndex + 2]);
-                
-                float D = abs(normal.x * pos.x + normal.y * pos.y + normal.z * pos.z + d) * denom;
-                if (D < 0.05f) {
-                  planePointsIndices.push_back(vertIndex);
-                  
-                  histo[hue_x].second -= 1;
-                  histoPoints[hue_x].erase(std::remove(histoPoints[hue_x].begin(), histoPoints[hue_x].end(), hue_x), histoPoints[hue_x].end());
-                  count++;
-                }
-              }
-              if (count == 0) {
-                break;
-              }
-            }
-  
-            for (int hue_x = hue+1; hue_x <= 179; hue_x++) {
-              vertIndices = histoPoints[hue_x];
-              int count = 0;
-              for (int i = 0; i < vertIndices.size(); i++) {
-                unsigned int vertIndex = vertIndices[i];
-                glm::vec3 pos = glm::vec3(meshVertices[vertIndex], meshVertices[vertIndex + 1], meshVertices[vertIndex + 2]);
-                
-                float D = abs(normal.x * pos.x + normal.y * pos.y + normal.z * pos.z + d) * denom;
-                if (D < 0.05f) {
-                  planePointsIndices.push_back(vertIndex);
-                  
-                  histo[hue_x].second -= 1;
-                  histoPoints[hue_x].erase(std::remove(histoPoints[hue_x].begin(), histoPoints[hue_x].end(), hue_x), histoPoints[hue_x].end());
-                  count++;
-                }
-              }
-              if (count == 0) {
-                break;
-              }
-            }
-            
-  
-            std::cout << planePointsIndices.size() << "\n";          
-            
-            unsigned int vertIndex = planePointsIndices[0];
-            glm::vec4 planeColor = glm::vec4(meshVertices[vertIndex + 3], meshVertices[vertIndex + 4], meshVertices[vertIndex + 5], meshVertices[vertIndex + 6]);
-            for (int i = 0; i < planePointsIndices.size(); i++) {
-              vertIndex = planePointsIndices[i];
-  
-              meshVertices2[vertIndex + 3] = planeColor.x;
-              meshVertices2[vertIndex + 4] = planeColor.y;
-              meshVertices2[vertIndex + 5] = planeColor.z;
-              meshVertices2[vertIndex + 6] = planeColor.w;
-            }
-  
-  
-            float normalMag = glm::length(normal);
-            glm::vec3 v = glm::cross(normal, glm::vec3(0.0f, 0.0f, 1.0f));
-            float cosTheta = normal.z / normalMag;
-            float sinTheta = glm::length(v) / normalMag;
-  
-            glm::vec3 k = glm::normalize(v);
-            glm::mat3 K = glm::mat3(0.0f, -k.z, k.y,
-                                    k.z, 0.0f, -k.x,
-                                  -k.y, k.x, 0.0f);
-            K = glm::transpose(K);
-            glm::mat3 R = glm::mat3(1.0f) + sinTheta * K + (1.0f - cosTheta) * K * K;
-  
-            std::vector<std::pair<unsigned int, glm::vec3>> planePoints(planePointsIndices.size());
-            for (int i = 0; i < planePointsIndices.size(); i++) {
-              unsigned int vertIndex = planePointsIndices[i];
-  
-              glm::vec3 pos = glm::vec3(meshVertices[vertIndex*7], meshVertices[vertIndex*7 + 1], meshVertices[vertIndex*7 + 2]);
-              glm::vec3 rotated = R * pos;
-              
-              planePoints[i].first = vertIndex;
-              planePoints[i].second = rotated;
-            }
-
-            foundPlane = true;
-            break;
-          }
-        }
-
-        if (!foundPlane) {
-          break;
-        }
-      }
-      */
-
-
-      glBindVertexArray(meshVAO);
-      glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
-      glBufferData(GL_ARRAY_BUFFER, meshVertices.size() * sizeof(float), meshVertices.data(), GL_DYNAMIC_DRAW);
-
-      glBindVertexArray(meshVAO2);
-      glBindBuffer(GL_ARRAY_BUFFER, meshVBO2);
-      glBufferData(GL_ARRAY_BUFFER, meshVertices2.size() * sizeof(float), meshVertices2.data(), GL_DYNAMIC_DRAW);
-
-      glBindBuffer(GL_ARRAY_BUFFER, 0);
-      glBindVertexArray(0);
-
-
-      listener.release(frames);
+      std::string histoString = "Histogram-" + std::to_string(k);
+      ImGui::PlotHistogram(histoString.c_str(), devices[k].histoDisplay, histoSize, 0, NULL, 0.0f, 1.0f, ImVec2(0, 80.0f));
     }
 
 
+    
     meshShader.use();
     meshShader.setMat4("WVP", VP);
-    //meshShader.setMat4("WVP", VP * glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f)));
-    glBindVertexArray(meshVAO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, meshEBO);
+    //meshShader.setMat4("WVP", VP * glm::translate(glm::mat4(1.0f), glm::vec3(-2.0f, 0.0f, 0.0f)));
+    glBindVertexArray(devices[0].meshVAO2);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, devices[0].meshEBO2);
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(meshIndices.size()), GL_UNSIGNED_INT, 0);
 
-    //meshShader.setMat4("WVP", VP);
-    //glBindVertexArray(meshVAO2);
-    //glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, meshEBO2);
-    //glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(meshIndices.size()), GL_UNSIGNED_INT, 0);
+    meshShader.setMat4("WVP", VP);
+    //meshShader.setMat4("WVP", VP * glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, 0.0f, 0.0f)));
+    glBindVertexArray(devices[1].meshVAO2);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, devices[1].meshEBO2);
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(meshIndices.size()), GL_UNSIGNED_INT, 0);
 
     //meshShader.use();
     ////meshShader.setMat4("WVP", VP);
@@ -891,13 +1092,28 @@ int main(int argc, char *argv[])
     //}
     
 
-    cv::imshow("rgb", cvRGB);
-    //cv::imshow("HDrgb", hdRGB);
-    cv::imshow("hsv", cvHSV);
-    std::vector<cv::Mat> channels;
-    cv::split(cvHSV, channels);
-    cv::imshow("hsv-hue", channels[0]);
-    cv::imshow("depth", cvDepth/4500.0f);
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    for (int k = 0; k < numDevices; k++) {
+      std::string rgbString = "rgb-" + std::to_string(k);
+      std::string depthString = "depth-" + std::to_string(k);
+      std::string depthSmoothString = "depthSmooth-" + std::to_string(k);
+      std::string rgbHDString = "rgbHD-" + std::to_string(k);
+      std::string hsvString = "hsv-" + std::to_string(k);
+      std::string hsvHueString = "hsvHue-" + std::to_string(k);
+
+      cv::imshow(rgbString, devices[k].rgb);
+      cv::imshow(depthString, devices[k].depth/4500.0f);
+      cv::imshow(depthSmoothString, devices[k].depthSmooth/4500.0f);
+      
+      //cv::imshow(rgbHDString, devices[k].rgbHD);
+      //cv::imshow(hsvString, devices[k].hsv);
+      //std::vector<cv::Mat> channels;
+      //cv::split(devices[k].hsv, channels);
+      //cv::imshow(hsvHueString, channels[0]);
+    }
+    
     int key = cv::waitKey(1);
     if (key == 'q')
       return -1;
@@ -914,11 +1130,24 @@ int main(int argc, char *argv[])
   // TODO: restarting ir stream doesn't work!
   // TODO: bad things will happen, if frame listeners are freed before dev->stop() :(
 /// [stop]
-  dev->stop();
-  dev->close();
+  for (int k = 0; k < numDevices; k++) {
+    delete devices[k].registration;
+
+    devices[k].dev->stop();
+    devices[k].dev->close();
+
+    delete devices[k].listener;
+  }
 /// [stop]
 
-  delete registration;
+
+  ImGui_ImplOpenGL3_Shutdown();
+  ImGui_ImplGlfw_Shutdown();
+  ImGui::DestroyContext();
+
+  glfwDestroyWindow(window);
+  //glfwTerminate();
+
 
   return 0;
 }
